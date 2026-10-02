@@ -371,7 +371,7 @@ const numbers = computed(() => {
 
 /** 连刀点缺口（来自派生结果，用于放大视图） */
 const bridges = computed(() => {
-  const out: Array<{ x: number; y: number; end: Pt; widthMm: number; local: Pt[]; contourId: string }> = []
+  const out: Array<{ x: number; y: number; end: Pt; widthMm: number; local: Pt[]; localBreak: number; contourId: string }> = []
   for (const s of props.shapes) {
     const comp = props.computed.get(s.id)
     if (!comp) continue
@@ -380,11 +380,12 @@ const bridges = computed(() => {
       if (!entry) continue
       for (const a of entry.anchors) {
         out.push({
-          x: a.end.x,
-          y: a.end.y,
-          end: a.at,
+          x: a.at.x,
+          y: a.at.y,
+          end: a.end,
           widthMm: a.widthMm,
           local: a.local,
+          localBreak: a.localBreak,
           contourId: c.id,
         })
       }
@@ -402,14 +403,17 @@ const magnifiers = computed(() => {
   return bridges.value.slice(0, limit).map((b, i) => {
     const anchor = toPx(pl({ x: b.x, y: b.y }))
     const center = { x: 62 + (i % 4) * 128, y: size.value.h - 74 - Math.floor(i / 4) * 128 }
-    const local = b.local.map((p) => {
+    const mapLocal = (p: Pt): Pt => {
       const s = toPx(pl(p))
       return { x: center.x + (s.x - anchor.x) * MAG, y: center.y + (s.y - anchor.y) * MAG }
-    })
+    }
+    // 缺口两侧的刀路分开画，断开处在放大镜里清晰可见
+    const localA = b.local.slice(0, b.localBreak).map(mapLocal)
+    const localB = b.local.slice(b.localBreak).map(mapLocal)
     const endPx = toPx(pl(b.end))
     const gapA = { x: center.x, y: center.y }
     const gapB = { x: center.x + (endPx.x - anchor.x) * MAG, y: center.y + (endPx.y - anchor.y) * MAG }
-    return { key: `${b.contourId}-${i}`, anchor, center, local, gapA, gapB, widthMm: b.widthMm, clipId: `magclip-${i}` }
+    return { key: `${b.contourId}-${i}`, anchor, center, localA, localB, gapA, gapB, widthMm: b.widthMm, clipId: `magclip-${i}` }
   })
 })
 
@@ -611,7 +615,13 @@ function focusContour(id: string): void {
         <circle :cx="m.center.x" :cy="m.center.y" r="56" fill="#0d1116" stroke="#ff8f3c" stroke-width="1.6" />
         <g :clip-path="`url(#${m.clipId})`">
           <polyline
-            :points="m.local.map((p) => `${p.x},${p.y}`).join(' ')"
+            :points="m.localA.map((p) => `${p.x},${p.y}`).join(' ')"
+            fill="none"
+            stroke="#cfd9e4"
+            stroke-width="1.6"
+          />
+          <polyline
+            :points="m.localB.map((p) => `${p.x},${p.y}`).join(' ')"
             fill="none"
             stroke="#cfd9e4"
             stroke-width="1.6"

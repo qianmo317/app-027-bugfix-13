@@ -43,8 +43,9 @@ export type BridgeAnchor = {
   end: Pt
   widthMm: number
   atIndex: number
-  /** 缺口附近的局部刀路（放大视图用） */
+  /** 缺口附近的局部刀路（放大视图用）：前 localBreak 个点属于缺口上游段，其余属于下游段 */
   local: Pt[]
+  localBreak: number
 }
 
 export type BridgePlan = {
@@ -170,86 +171,77 @@ export function planBridges(
     atIndex: rawIdx[i],
   }))
   gaps.sort((a, b) => a.s - b.s)
-  // 手工放置尊重用户点选位置，不做吸附；规则生成则吸附到单条直线段内
-  const snapped = opts.rule === 'manual' ? { gaps, dropped: 0 } : snapGapsToEdges(pts, acc, L, gaps)
-  if (snapped.dropped > 0) {
+  // 手工放置尊重用户点选位置；规则生成只在「所在边能容纳」时把缺口收进单条直线段内，
+  // 点密（边比缺口短）时保持精确弧长位置——不做远距离搬迁，保证缺口沿弧长均匀分布。
+  const placed = opts.rule === 'manual' ? gaps : placeGapsWithinEdges(pts, acc, L, gaps)
+  // 环形去重：相邻缺口（含绕回起点的一对）不许重叠
+  const { gaps: finalGaps, dropped } = dropOverlappingGaps(placed, L)
+  if (dropped > 0) {
     metrics.degraded = true
-    metrics.reason += `；${snapped.dropped} 个连刀点因相邻间距不足被合并`
+    metrics.reason += `；${dropped} 个连刀点因相邻间距不足被合并`
   }
-  for (const g of snapped.gaps) g.atIndex = nearestIndex(acc, g.s)
+  for (const g of finalGaps) g.atIndex = nearestIndex(acc, g.s)
 
-  const stats = gapStats(pts, L, snapped.gaps)
-  metrics.count = snapped.gaps.length
-  metrics.arcs = snapped.gaps.map((g) => g.widthMm)
+  const stats = gapStats(pts, L, finalGaps)
+  metrics.count = finalGaps.length
+  metrics.arcs = finalGaps.map((g) => g.widthMm)
   metrics.widths = stats.widths
   metrics.geometryDeviationMm = stats.deviation
-  metrics.lengthAfter = L - snapped.gaps.reduce((a, g) => a + g.widthMm, 0)
+  metrics.lengthAfter = L - finalGaps.reduce((a, g) => a + g.widthMm, 0)
   metrics.areaAfter = Math.max(0, A - stats.removedArea)
 
   return {
-    gaps: snapped.gaps,
-    bridges: snapped.gaps.map((g) => ({ atIndex: g.atIndex, widthMm: g.widthMm })),
+    gaps: finalGaps,
+    bridges: finalGaps.map((g) => ({ atIndex: g.atIndex, widthMm: g.widthMm })),
     metrics,
   }
 }
 
 /**
- * 把缺口吸附到「单条直线段」内部：缺口不跨越折角。
- * 这样缺口两端是平滑过渡（避免刀路折角），且缺口宽度 = 弦长 = 设定值，几何偏差为 0。
+ * 缺口位置微调：仅当缺口所在的单条边能容纳整个缺口时，把它收进该边内部
+ * （移动量小于一个缺口宽度，不跨折角，几何偏差为 0）。
+ * 所在边太短（点密）时保持精确弧长位置，缺口沿折线跨越多条短边——
+ * 缺口按弧长均匀分布是硬性要求，不允许为了「凑进长边」把缺口搬到远处。
  */
-function snapGapsToEdges(pts: Pt[], acc: number[], L: number, gaps: BridgeGap[]): { gaps: BridgeGap[]; dropped: number } {
+function placeGapsWithinEdges(pts: Pt[], acc: number[], L: number, gaps: BridgeGap[]): BridgeGap[] {
   const n = pts.length
-  const edges: Array<{ i: number; lo: number; hi: number }> = []
+  const edges: Array<{ lo: number; hi: number }> = []
   for (let i = 0; i < n; i++) {
     const lo = acc[i]
     const hi = i + 1 < n ? acc[i + 1] : L
-    if (hi - lo > 1e-9) edges.push({ i, lo, hi })
+    if (hi - lo > 1e-9) edges.push({ lo, hi })
   }
-  if (edges.length === 0) return { gaps, dropped: 0 }
+  if (edges.length === 0) return gaps
 
-  const out: BridgeGap[] = []
-  for (const g of gaps) {
+  return gaps.map((g) => {
     const w = g.widthMm
-    const fitting = edges.filter((e) => e.hi - e.lo >= w + 1e-9)
-    let edge: { i: number; lo: number; hi: number } | null = null
     const containing = edges.find((e) => g.s >= e.lo - 1e-9 && g.s < e.hi - 1e-9)
-    if (containing && containing.hi - containing.lo >= w + 1e-9) {
-      edge = containing
-    } else if (fitting.length > 0) {
-      // 所在边太短 → 取弧长距离最近的可容纳边
-      let best = fitting[0]
-      let bestD = Infinity
-      for (const e of fitting) {
-        const d = g.s < e.lo ? e.lo - g.s : g.s > e.hi ? g.s - e.hi : 0
-        if (d < bestD) {
-          bestD = d
-          best = e
-        }
-      }
-      edge = best
-    }
-    if (!edge) {
-      // 没有任何边能容纳：取最长边并把宽度削到该边的 60%
-      let longest = edges[0]
-      for (const e of edges) if (e.hi - e.lo > longest.hi - longest.lo) longest = e
-      const len = longest.hi - longest.lo
-      const w2 = Math.max(0.02, Math.min(w, len * 0.6))
-      const s2 = longest.lo + (len - w2) / 2
-      out.push({ s: s2, widthMm: Math.round(w2 * 10000) / 10000, atIndex: g.atIndex })
-      continue
-    }
-    const lo = edge.lo
-    const hi = edge.hi - w
-    let s = g.s
-    if (s < lo || s > hi) s = lo + (hi - lo) / 2
-    else s = Math.min(Math.max(s, lo), hi)
-    out.push({ s, widthMm: g.widthMm, atIndex: g.atIndex })
-  }
+    if (!containing || containing.hi - containing.lo < w + 1e-9) return { ...g }
+    const s = Math.min(Math.max(g.s, containing.lo), containing.hi - w)
+    return { ...g, s }
+  })
+}
 
-  out.sort((a, b) => a.s - b.s)
-  const kept: BridgeGap[] = out.filter((g, i) => i === 0 || g.s >= out[i - 1].s + out[i - 1].widthMm + 1e-6)
-  const dropped = out.length - kept.length
-  return { gaps: kept, dropped }
+/**
+ * 环形重叠检查：相邻缺口（含绕回起点的最后一对）不许重叠，
+ * 重叠时合并掉位置靠后的一个（保留先放置的）。
+ */
+function dropOverlappingGaps(gaps: BridgeGap[], L: number): { gaps: BridgeGap[]; dropped: number } {
+  const sorted = gaps.slice().sort((a, b) => a.s - b.s)
+  const kept: BridgeGap[] = []
+  for (const g of sorted) {
+    const prev = kept[kept.length - 1]
+    if (prev && g.s < prev.s + prev.widthMm - 1e-9) continue
+    kept.push(g)
+  }
+  // 绕回起点的一对：最后一个缺口的末端 vs 第一个缺口的起点
+  while (kept.length > 1) {
+    const last = kept[kept.length - 1]
+    const first = kept[0]
+    if (last.s + last.widthMm > first.s + L - 1e-9) kept.pop()
+    else break
+  }
+  return { gaps: kept, dropped: sorted.length - kept.length }
 }
 
 function gapStats(
@@ -313,17 +305,31 @@ export function applyBridges(pts: Pt[], closed: boolean, gaps: BridgeGap[]): Cut
   return runs.length > 0 ? runs : [{ points: pts, closed: true }]
 }
 
-/** 取自弧长 a 到 b 的折线（b 可超过 L，表示跨越起点） */
+/** 取自弧长 a 到 b 的折线（b 可超过 L，表示跨越起点）；两端精确落在 a / b 上 */
 function collectRun(pts: Pt[], acc: number[], L: number, a: number, b: number): Pt[] {
   const out: Pt[] = []
+  const push = (p: Pt): void => {
+    const last = out[out.length - 1]
+    if (!last || dist(last, p) > 1e-9) out.push(p)
+  }
+  const norm = (s: number): number => ((s % L) + L) % L
+  // 起点精确落在缺口边缘
+  push(pointAtArcLength(pts, true, norm(a)))
+  // 中间顶点必须按弧长顺序输出：先 (a, L) 段，跨圈时再接 [0, b−L) 段（绕回起点的前半段）
   for (let i = 0; i < pts.length; i++) {
     const s = acc[i]
-    if (s >= a && s <= b) out.push(pts[i])
+    if (s > a + 1e-9 && s < b - 1e-9) push(pts[i])
   }
-  if (out.length < 2) {
-    return [{ ...pointAtArcLength(pts, true, a % L) }, { ...pointAtArcLength(pts, true, b % L) }]
+  if (b > L) {
+    for (let i = 0; i < pts.length; i++) {
+      const s = acc[i] + L
+      if (s > a + 1e-9 && s < b - 1e-9) push(pts[i])
+    }
   }
-  return out
+  // 终点精确落在缺口边缘
+  push(pointAtArcLength(pts, true, norm(b)))
+  if (out.length >= 2) return out
+  return [{ ...pointAtArcLength(pts, true, norm(a)) }, { ...pointAtArcLength(pts, true, norm(b)) }]
 }
 
 /** 由刀路段推导连刀点锚点（缺口 = 上一段末尾 → 下一段开头） */
@@ -334,23 +340,29 @@ export function anchorsFromRuns(runs: CutRun[], widthMm: number, atIndices: numb
     if (gapCount <= 0) return []
     const p = runs[0].points
     if (p.length < 2) return []
+    const tail = p.slice(-4)
+    const head = p.slice(0, 4)
     return [
       {
         at: p[p.length - 1],
         end: p[0],
         widthMm,
         atIndex: atIndices[0] ?? 0,
-        local: [...p.slice(-4), ...p.slice(0, 4)],
+        local: [...tail, ...head],
+        localBreak: tail.length,
       },
     ]
   }
   const out: BridgeAnchor[] = []
   for (let i = 0; i < runs.length; i++) {
+    const prev = runs[(i - 1 + runs.length) % runs.length]
     const cur = runs[i]
-    const at = cur.points[0]
-    const end = cur.points[cur.points.length - 1]
-    const local = [...cur.points.slice(0, 4), ...cur.points.slice(-4)]
-    out.push({ at, end, widthMm, atIndex: atIndices[i] ?? 0, local })
+    // 第 i 个缺口 = 上一段刀路的末尾 → 本段刀路的开头（真正断开的位置）
+    const at = prev.points[prev.points.length - 1]
+    const end = cur.points[0]
+    const tail = prev.points.slice(-4)
+    const head = cur.points.slice(0, 4)
+    out.push({ at, end, widthMm, atIndex: atIndices[i] ?? 0, local: [...tail, ...head], localBreak: tail.length })
   }
   return out
 }

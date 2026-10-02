@@ -6,7 +6,8 @@ import { importSvgText } from './importer'
 import { computeShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
-import { polygonArea, polylineLength } from './geometry'
+import { dist, pointAtArcLength, polygonArea, polylineLength } from './geometry'
+import { anchorsFromRuns, applyBridges, planBridges } from './bridges'
 
 export type CheckResult = {
   id: string
@@ -215,7 +216,7 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
       'bridge-deviation',
       '轮廓几何偏差 ≤ 0.1mm（挖缺口后重算面积/周长并记录偏差）',
       devLarge <= 0.1,
-      `缺口吸附在单条直线段内（不跨折角）：最大几何偏差 ${devAll.toFixed(5)}mm（长度 ≥20mm 轮廓 ${devLarge.toFixed(5)}mm）｜` +
+      `缺口按弧长定位，所在边能容纳时收进单条直线段内：最大几何偏差 ${devAll.toFixed(5)}mm（长度 ≥20mm 轮廓 ${devLarge.toFixed(5)}mm）｜` +
         `被挖掉的最大面积 ${maxAreaDelta.toFixed(4)}mm²、最大周长 ${maxLengthDelta.toFixed(3)}mm（已重算并记录）`,
     ),
   )
@@ -254,6 +255,139 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
       lengthRuleOk ? `每 ${settings.bridgeEveryMm}mm 一个连刀点，校验 ${lengthRuleCount} 条大轮廓全部吻合` : lengthRuleDetail.join('；'),
     ),
   )
+
+  // ---------- 2.5 连刀点：均匀分布 / 绕回起点 / 不重叠 / 锚点位置 ----------
+  {
+    // 点疏密不均：底边 0.2mm 密集采样，其余三边只有角点
+    const uneven: Pt[] = []
+    for (let x = 0; x <= 120; x += 0.2) uneven.push({ x, y: 0 })
+    uneven.push({ x: 120, y: 30 }, { x: 0, y: 30 })
+    const LU = polylineLength(uneven, true)
+    const planU = planBridges(uneven, true, polygonArea(uneven), LU, {
+      rule: 'by_length',
+      areaThresholdMm2: settings.areaThresholdMm2,
+      bridgeWidthMm: settings.bridgeWidthMm,
+      bridgeEveryMm: settings.bridgeEveryMm,
+    })
+    const expectU = Math.floor(LU / settings.bridgeEveryMm)
+    const ssU = planU.gaps.map((g) => g.s).sort((a, b) => a - b)
+    let maxDevU = 0
+    for (let i = 0; i < ssU.length; i++) {
+      const next = i + 1 < ssU.length ? ssU[i + 1] : ssU[0] + LU
+      maxDevU = Math.max(maxDevU, Math.abs(next - ssU[i] - LU / ssU.length))
+    }
+    const topGaps = planU.gaps.filter((g) => pointAtArcLength(uneven, true, g.s + g.widthMm / 2).y > 29).length
+    checks.push(
+      ok(
+        'bridge-even',
+        '缺口按弧长均匀分布（点疏密不均时不挤在一侧、长边中间不断档）',
+        planU.metrics.count === expectU && maxDevU <= 1 && topGaps >= 5,
+        `周长 ${LU.toFixed(1)}mm → ${planU.metrics.count}/${expectU} 个缺口，相邻间距最大偏差 ${maxDevU.toFixed(2)}mm，顶部长边缺口 ${topGaps} 个`,
+      ),
+    )
+  }
+
+  {
+    // 跨起点的缺口：[150,160]∪[0,4] 必须完整挖掉，绕回起点的刀路段不许少一截
+    const sq: Pt[] = [
+      { x: 0, y: 0 },
+      { x: 40, y: 0 },
+      { x: 40, y: 40 },
+      { x: 0, y: 40 },
+    ]
+    const LS = polylineLength(sq, true)
+    const runsW = applyBridges(sq, true, [
+      { s: 150, widthMm: 4, atIndex: 3 },
+      { s: 50, widthMm: 4, atIndex: 1 },
+    ])
+    const totalW = runsW.reduce((a, r) => a + polylineLength(r.points, false), 0)
+    const cornerKept = runsW.some((r) => r.points.some((p) => p.x === 40 && p.y === 0))
+    checks.push(
+      ok(
+        'bridge-wrap',
+        '绕回起点的缺口完整断开，跨起点刀路段不少一截',
+        runsW.length === 2 && Math.abs(totalW - (LS - 8)) < 1e-6 && cornerKept,
+        `2 个 4mm 缺口 → ${runsW.length} 段，刀路总长 ${totalW.toFixed(2)}mm（应为 ${LS - 8}mm），跨起点段保留中间角点 = ${cornerKept}`,
+      ),
+    )
+  }
+
+  {
+    // 手工在起点两侧各放一个缺口：跨起点的一对不许互相压住
+    const circ: Pt[] = []
+    for (let i = 0; i < 20; i++) {
+      const a = (i / 20) * Math.PI * 2
+      circ.push({ x: 10 + 3 * Math.cos(a), y: 10 + 3 * Math.sin(a) })
+    }
+    const LC = polylineLength(circ, true)
+    const planM = planBridges(
+      circ,
+      true,
+      polygonArea(circ),
+      LC,
+      { rule: 'manual', areaThresholdMm2: settings.areaThresholdMm2, bridgeWidthMm: 1.5, bridgeEveryMm: settings.bridgeEveryMm },
+      [0, 19, 5, 10],
+    )
+    const gs = planM.gaps.slice().sort((a, b) => a.s - b.s)
+    let overlap = false
+    for (let i = 0; i < gs.length; i++) {
+      const nxt = i + 1 < gs.length ? gs[i + 1].s : gs[0].s + LC
+      if (gs[i].s + gs[i].widthMm > nxt + 1e-9) overlap = true
+    }
+    checks.push(
+      ok(
+        'bridge-no-overlap',
+        '相邻缺口（含绕回起点的一对）不重叠',
+        !overlap,
+        `短轮廓（周长 ${LC.toFixed(1)}mm）手工 4 个宽 1.5mm 缺口（含起点两侧）→ 生效 ${gs.length} 个，重叠 = ${overlap}`,
+      ),
+    )
+  }
+
+  {
+    // 锚点必须落在真正断开处：第 i 个锚点 = 第 i 个缺口的两端
+    const circ2: Pt[] = []
+    for (let i = 0; i < 100; i++) {
+      const a = (i / 100) * Math.PI * 2
+      circ2.push({ x: 50 + 30 * Math.cos(a), y: 50 + 30 * Math.sin(a) })
+    }
+    const LC2 = polylineLength(circ2, true)
+    const planA = planBridges(circ2, true, polygonArea(circ2), LC2, {
+      rule: 'by_length',
+      areaThresholdMm2: settings.areaThresholdMm2,
+      bridgeWidthMm: settings.bridgeWidthMm,
+      bridgeEveryMm: 40,
+    })
+    const runsA = applyBridges(circ2, true, planA.gaps)
+    const anchorsA = anchorsFromRuns(
+      runsA,
+      planA.metrics.appliedWidthMm,
+      planA.gaps.map((g) => g.atIndex),
+      planA.gaps.length,
+    )
+    let maxErr = 0
+    for (let i = 0; i < planA.gaps.length; i++) {
+      const g = planA.gaps[i]
+      const a = anchorsA[i]
+      if (!a) {
+        maxErr = Infinity
+        break
+      }
+      maxErr = Math.max(
+        maxErr,
+        dist(a.at, pointAtArcLength(circ2, true, g.s)),
+        dist(a.end, pointAtArcLength(circ2, true, (g.s + g.widthMm) % LC2)),
+      )
+    }
+    checks.push(
+      ok(
+        'bridge-anchor-pos',
+        '放大视图 / 放大镜的锚点落在真正断开处（缺口两端）',
+        anchorsA.length === planA.gaps.length && maxErr <= 1e-6,
+        `${anchorsA.length} 个锚点与缺口两端最大偏差 ${maxErr.toFixed(4)}mm`,
+      ),
+    )
+  }
 
   // ---------- 3. 切割顺序：先内后外 ----------
   let orderOk = true
