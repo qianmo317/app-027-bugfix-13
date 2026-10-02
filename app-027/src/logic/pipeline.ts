@@ -1,5 +1,5 @@
 import type { Bridge, ContourWarning, CutSettings, MaterialPreset, Pt, Shape } from './types'
-import { anchorsFromRuns, applyBridges, planBridges, type BridgeAnchor, type BridgeMetrics, type CutRun } from './bridges'
+import { applyBridges, planBridges, type BridgeAnchor, type BridgeMetrics, type CutRun } from './bridges'
 import { buildContainmentTree, type NestingResult } from './nesting'
 import { orderCut, type OrderResult } from './order'
 import { offsetPolygon } from './offset'
@@ -77,11 +77,11 @@ export function shapeSignature(shape: Shape, settings: CutSettings, material: Ma
 function mapGapsToLoops(
   loops: Pt[][],
   gaps: Array<{ frac: number; widthMm: number; atIndex: number }>,
-): CutRun[] {
-  if (gaps.length === 0) return loops.map((p) => ({ points: p, closed: true }))
+): { runs: CutRun[]; anchors: BridgeAnchor[] } {
+  if (gaps.length === 0) return { runs: loops.map((p) => ({ points: p, closed: true })), anchors: [] }
   const lens = loops.map((l) => polylineLength(l, true))
   const total = lens.reduce((a, b) => a + b, 0)
-  if (total <= 0) return loops.map((p) => ({ points: p, closed: true }))
+  if (total <= 0) return { runs: loops.map((p) => ({ points: p, closed: true })), anchors: [] }
   const accStart: number[] = []
   let running = 0
   for (const l of lens) {
@@ -90,7 +90,7 @@ function mapGapsToLoops(
   }
   const byLoop: Array<Array<{ s: number; widthMm: number; atIndex: number }>> = loops.map(() => [])
   for (const g of gaps) {
-    const s = ((g.frac % 1) + 1) % 1 * total
+    const s = (((g.frac % 1) + 1) % 1) * total
     let li = loops.length - 1
     for (let i = 0; i < loops.length; i++) {
       if (s >= accStart[i] && (i === loops.length - 1 || s < accStart[i] + lens[i])) {
@@ -102,11 +102,20 @@ function mapGapsToLoops(
     byLoop[li].push({ s: sLocal, widthMm: g.widthMm, atIndex: g.atIndex })
   }
   const runs: CutRun[] = []
+  const anchors: BridgeAnchor[] = []
   loops.forEach((pts, i) => {
-    const gaps = byLoop[i].map((g) => ({ s: g.s, widthMm: g.widthMm, atIndex: g.atIndex }))
-    runs.push(...applyBridges(pts, true, gaps))
+    if (byLoop[i].length === 0) {
+      runs.push({ points: pts, closed: true })
+      return
+    }
+    // 刀补后该环可能比原轮廓短：缺口总宽超环周长 60% 时按比例削窄，保证缺口互不重叠
+    const cap = (0.6 * lens[i]) / byLoop[i].length
+    const lg = byLoop[i].map((g) => ({ ...g, widthMm: Math.min(g.widthMm, Math.max(0.02, cap)) }))
+    const res = applyBridges(pts, true, lg)
+    runs.push(...res.runs)
+    anchors.push(...res.anchors)
   })
-  return runs
+  return { runs, anchors }
 }
 
 /**
@@ -184,16 +193,10 @@ export function computeShape(
       }
     }
 
-    // 3) 连刀点开挖 → 切割段
-    const runs = c.closed ? mapGapsToLoops(loops, gapFracs) : [{ points: c.points, closed: false }]
-    const anchors = c.closed
-      ? anchorsFromRuns(
-          runs,
-          plan.metrics.appliedWidthMm,
-          plan.gaps.map((g) => g.atIndex),
-          plan.gaps.length,
-        )
-      : []
+    // 3) 连刀点开挖 → 切割段（锚点为缺口真正断开的两个端点）
+    const cut = c.closed ? mapGapsToLoops(loops, gapFracs) : { runs: [{ points: c.points, closed: false }], anchors: [] }
+    const runs = cut.runs
+    const anchors = cut.anchors
 
     byId.set(c.id, { id: c.id, runs, bridgeMetrics: plan.metrics, anchors, offsetOk, offsetMessage })
     runsOf.set(c.id, runs)

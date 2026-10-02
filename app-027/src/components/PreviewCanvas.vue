@@ -371,7 +371,15 @@ const numbers = computed(() => {
 
 /** 连刀点缺口（来自派生结果，用于放大视图） */
 const bridges = computed(() => {
-  const out: Array<{ x: number; y: number; end: Pt; widthMm: number; local: Pt[]; contourId: string }> = []
+  const out: Array<{
+    x: number
+    y: number
+    end: Pt
+    widthMm: number
+    localBefore: Pt[]
+    localAfter: Pt[]
+    contourId: string
+  }> = []
   for (const s of props.shapes) {
     const comp = props.computed.get(s.id)
     if (!comp) continue
@@ -380,11 +388,12 @@ const bridges = computed(() => {
       if (!entry) continue
       for (const a of entry.anchors) {
         out.push({
-          x: a.end.x,
-          y: a.end.y,
-          end: a.at,
+          x: a.at.x,
+          y: a.at.y,
+          end: a.end,
           widthMm: a.widthMm,
-          local: a.local,
+          localBefore: a.localBefore,
+          localAfter: a.localAfter,
           contourId: c.id,
         })
       }
@@ -400,16 +409,32 @@ const magnifiers = computed(() => {
   if (!props.magnify || props.mode !== 'bridge') return []
   const limit = 8
   return bridges.value.slice(0, limit).map((b, i) => {
-    const anchor = toPx(pl({ x: b.x, y: b.y }))
+    // 引线指向缺口中点；放大镜以「缺口前端 at」为圆心原点，断开处与真正缺口对齐
+    const gapStart = toPx(pl({ x: b.x, y: b.y }))
+    const gapEnd = toPx(pl(b.end))
+    const anchor = { x: (gapStart.x + gapEnd.x) / 2, y: (gapStart.y + gapEnd.y) / 2 }
     const center = { x: 62 + (i % 4) * 128, y: size.value.h - 74 - Math.floor(i / 4) * 128 }
-    const local = b.local.map((p) => {
+    const before = b.localBefore.map((p) => {
       const s = toPx(pl(p))
-      return { x: center.x + (s.x - anchor.x) * MAG, y: center.y + (s.y - anchor.y) * MAG }
+      return { x: center.x + (s.x - gapStart.x) * MAG, y: center.y + (s.y - gapStart.y) * MAG }
     })
-    const endPx = toPx(pl(b.end))
+    const after = b.localAfter.map((p) => {
+      const s = toPx(pl(p))
+      return { x: center.x + (s.x - gapStart.x) * MAG, y: center.y + (s.y - gapStart.y) * MAG }
+    })
     const gapA = { x: center.x, y: center.y }
-    const gapB = { x: center.x + (endPx.x - anchor.x) * MAG, y: center.y + (endPx.y - anchor.y) * MAG }
-    return { key: `${b.contourId}-${i}`, anchor, center, local, gapA, gapB, widthMm: b.widthMm, clipId: `magclip-${i}` }
+    const gapB = { x: center.x + (gapEnd.x - gapStart.x) * MAG, y: center.y + (gapEnd.y - gapStart.y) * MAG }
+    return {
+      key: `${b.contourId}-${i}`,
+      anchor,
+      center,
+      before,
+      after,
+      gapA,
+      gapB,
+      widthMm: b.widthMm,
+      clipId: `magclip-${i}`,
+    }
   })
 })
 
@@ -611,7 +636,15 @@ function focusContour(id: string): void {
         <circle :cx="m.center.x" :cy="m.center.y" r="56" fill="#0d1116" stroke="#ff8f3c" stroke-width="1.6" />
         <g :clip-path="`url(#${m.clipId})`">
           <polyline
-            :points="m.local.map((p) => `${p.x},${p.y}`).join(' ')"
+            v-if="m.before.length >= 2"
+            :points="m.before.map((p) => `${p.x},${p.y}`).join(' ')"
+            fill="none"
+            stroke="#cfd9e4"
+            stroke-width="1.6"
+          />
+          <polyline
+            v-if="m.after.length >= 2"
+            :points="m.after.map((p) => `${p.x},${p.y}`).join(' ')"
             fill="none"
             stroke="#cfd9e4"
             stroke-width="1.6"

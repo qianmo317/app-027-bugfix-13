@@ -37,14 +37,16 @@ export type BridgeRuleOptions = {
 /** 缺口：s 为沿轮廓的精确弧长起点，widthMm 为挖掉的弧长 */
 export type BridgeGap = { s: number; widthMm: number; atIndex: number }
 
-/** 连刀点锚点（供预览与放大视图使用） */
+/** 连刀点锚点（供预览与放大视图使用）：at/end 为缺口真正断开的两个端点 */
 export type BridgeAnchor = {
   at: Pt
   end: Pt
   widthMm: number
   atIndex: number
-  /** 缺口附近的局部刀路（放大视图用） */
-  local: Pt[]
+  /** 缺口两端附近的局部刀路（放大视图用）：at 前的一段刀路 */
+  localBefore: Pt[]
+  /** end 后的一段刀路；放大镜中两条折线之间即真正的断开处 */
+  localAfter: Pt[]
 }
 
 export type BridgePlan = {
@@ -151,10 +153,10 @@ export function planBridges(
     }
     metrics.reason = `手工放置 ${rawS.length} 个连刀点`
   } else if (A < opts.areaThresholdMm2) {
-    // 碎片：两个连刀点尽量均匀（相隔半个周长）
+    // 碎片：两个连刀点相隔半个周长（等弧长分布）
     rawS.push(L * 0.25, L * 0.75)
     rawIdx.push(nearestIndex(acc, L * 0.25), nearestIndex(acc, L * 0.75))
-    metrics.reason = `碎片面积 ${A.toFixed(2)}mm² < 阈值 ${opts.areaThresholdMm2}mm²，强制 ${rawS.length} 个连刀点（均匀分布）`
+    metrics.reason = `碎片面积 ${A.toFixed(2)}mm² < 阈值 ${opts.areaThresholdMm2}mm²，强制 2 个连刀点（均匀分布）`
   } else {
     for (let k = 0; k < required; k++) {
       const s = (L * (k + 0.5)) / required
@@ -164,92 +166,101 @@ export function planBridges(
     metrics.reason = `周长 ${L.toFixed(2)}mm ÷ ${opts.bridgeEveryMm}mm → ${required} 个连刀点（等弧长分布）`
   }
 
-  const gaps: BridgeGap[] = rawS.map((s, i) => ({
+  let gaps: BridgeGap[] = rawS.map((s, i) => ({
     s: ((s % L) + L) % L,
     widthMm: Math.round(appliedWidth * 10000) / 10000,
     atIndex: rawIdx[i],
   }))
   gaps.sort((a, b) => a.s - b.s)
-  // 手工放置尊重用户点选位置，不做吸附；规则生成则吸附到单条直线段内
-  const snapped = opts.rule === 'manual' ? { gaps, dropped: 0 } : snapGapsToEdges(pts, acc, L, gaps)
-  if (snapped.dropped > 0) {
-    metrics.degraded = true
-    metrics.reason += `；${snapped.dropped} 个连刀点因相邻间距不足被合并`
+  // 缺口不允许跨越轮廓起点（s=0）：跨缝的缺口会被「绕回段」切成两半。
+  // 把这样的缺口整体贴着起点放在缝前，绕回段仍按完整一刀断开。
+  for (const g of gaps) {
+    if (g.s + g.widthMm > L) g.s = Math.max(0, L - g.widthMm)
   }
-  for (const g of snapped.gaps) g.atIndex = nearestIndex(acc, g.s)
+  // 缺口严格按等弧长位置排布；仅在「缺口所在的同一条边」内做有界微调，
+  // 让缺口尽量落在单条直线段内（宽度=弦长）。绝不迁移到别的边——
+  // 否则点疏密不均时所有缺口都会被挤到点密的一侧，长边中段一个都没有。
+  if (opts.rule !== 'manual') gaps = snapGapWithinOwnEdge(pts, acc, L, gaps)
+  // 环形去重：按弧长排序后，既检查相邻也检查首尾（绕回起点处）
+  const dedup = dropOverlappingGaps(gaps, L)
+  gaps = dedup.gaps
+  if (dedup.dropped > 0) {
+    metrics.degraded = true
+    metrics.reason += `；${dedup.dropped} 个连刀点因与相邻缺口重叠被合并`
+  }
+  for (const g of gaps) g.atIndex = nearestIndex(acc, g.s)
 
-  const stats = gapStats(pts, L, snapped.gaps)
-  metrics.count = snapped.gaps.length
-  metrics.arcs = snapped.gaps.map((g) => g.widthMm)
+  const stats = gapStats(pts, L, gaps)
+  metrics.count = gaps.length
+  metrics.arcs = gaps.map((g) => g.widthMm)
   metrics.widths = stats.widths
   metrics.geometryDeviationMm = stats.deviation
-  metrics.lengthAfter = L - snapped.gaps.reduce((a, g) => a + g.widthMm, 0)
+  metrics.lengthAfter = L - gaps.reduce((a, g) => a + g.widthMm, 0)
   metrics.areaAfter = Math.max(0, A - stats.removedArea)
 
   return {
-    gaps: snapped.gaps,
-    bridges: snapped.gaps.map((g) => ({ atIndex: g.atIndex, widthMm: g.widthMm })),
+    gaps,
+    bridges: gaps.map((g) => ({ atIndex: g.atIndex, widthMm: g.widthMm })),
     metrics,
   }
 }
 
 /**
- * 把缺口吸附到「单条直线段」内部：缺口不跨越折角。
- * 这样缺口两端是平滑过渡（避免刀路折角），且缺口宽度 = 弦长 = 设定值，几何偏差为 0。
+ * 仅在缺口「当前所在的同一条直线段」内部微调缺口起点，使缺口尽量不跨越折角。
+ * 移动范围被严格限制在该边内部（最多半个边长），因此缺口不会迁移、不会聚集；
+ * 所在边短到放不下缺口时保持等弧长原位置不动（缺口允许跨过顶点，
+ * 开挖时会精确地沿弧长断开，几何完整保留）。
  */
-function snapGapsToEdges(pts: Pt[], acc: number[], L: number, gaps: BridgeGap[]): { gaps: BridgeGap[]; dropped: number } {
+function snapGapWithinOwnEdge(pts: Pt[], acc: number[], L: number, gaps: BridgeGap[]): BridgeGap[] {
   const n = pts.length
-  const edges: Array<{ i: number; lo: number; hi: number }> = []
-  for (let i = 0; i < n; i++) {
-    const lo = acc[i]
-    const hi = i + 1 < n ? acc[i + 1] : L
-    if (hi - lo > 1e-9) edges.push({ i, lo, hi })
-  }
-  if (edges.length === 0) return { gaps, dropped: 0 }
+  return gaps.map((g) => {
+    // 二分找到 s 所在的边 i（acc[i] <= s < acc[i+1]，最后一条边绕回起点）
+    let loIdx = 0
+    let hiIdx = n - 1
+    while (loIdx < hiIdx) {
+      const mid = (loIdx + hiIdx + 1) >> 1
+      if (acc[mid] <= g.s + 1e-9) loIdx = mid
+      else hiIdx = mid - 1
+    }
+    const i = loIdx
+    const eLo = acc[i]
+    const eHi = i + 1 < n ? acc[i + 1] : L
+    const edgeLen = eHi - eLo
+    if (edgeLen < g.widthMm + 1e-9) return g
+    // 把缺口夹在边内 [eLo, eHi - w]；s 已在边内，偏移不会超过半个边长
+    const s = Math.min(Math.max(g.s, eLo), eHi - g.widthMm)
+    return { ...g, s }
+  })
+}
 
-  const out: BridgeGap[] = []
-  for (const g of gaps) {
-    const w = g.widthMm
-    const fitting = edges.filter((e) => e.hi - e.lo >= w + 1e-9)
-    let edge: { i: number; lo: number; hi: number } | null = null
-    const containing = edges.find((e) => g.s >= e.lo - 1e-9 && g.s < e.hi - 1e-9)
-    if (containing && containing.hi - containing.lo >= w + 1e-9) {
-      edge = containing
-    } else if (fitting.length > 0) {
-      // 所在边太短 → 取弧长距离最近的可容纳边
-      let best = fitting[0]
-      let bestD = Infinity
-      for (const e of fitting) {
-        const d = g.s < e.lo ? e.lo - g.s : g.s > e.hi ? g.s - e.hi : 0
-        if (d < bestD) {
-          bestD = d
-          best = e
-        }
+/**
+ * 环形去重：缺口按弧长排序后，删除与「前一个」或「绕回后第一个」缺口重叠的缺口。
+ * 线性扫描只检查相邻，处理不了首尾相接的情况——短轮廓、缺口多时，
+ * 起点两侧会落下两个互相压住的缺口（等于挖掉双倍宽度）。
+ */
+function dropOverlappingGaps(gaps: BridgeGap[], L: number): { gaps: BridgeGap[]; dropped: number } {
+  const EPS = 1e-6
+  let cur = gaps.slice().sort((a, b) => a.s - b.s)
+  let dropped = 0
+  // 重复扫描直到稳定：删掉某个缺口后其两侧可能变为新的相邻关系
+  for (;;) {
+    if (cur.length <= 1) break
+    let remove = -1
+    for (let i = 0; i < cur.length; i++) {
+      const g = cur[i]
+      const prev = cur[(i - 1 + cur.length) % cur.length]
+      // 前一缺口末端（考虑绕回：i=0 时前一缺口在 L 之前）
+      const prevEnd = i === 0 ? prev.s + prev.widthMm - L : prev.s + prev.widthMm
+      if (g.s < prevEnd - EPS) {
+        remove = i
+        break
       }
-      edge = best
     }
-    if (!edge) {
-      // 没有任何边能容纳：取最长边并把宽度削到该边的 60%
-      let longest = edges[0]
-      for (const e of edges) if (e.hi - e.lo > longest.hi - longest.lo) longest = e
-      const len = longest.hi - longest.lo
-      const w2 = Math.max(0.02, Math.min(w, len * 0.6))
-      const s2 = longest.lo + (len - w2) / 2
-      out.push({ s: s2, widthMm: Math.round(w2 * 10000) / 10000, atIndex: g.atIndex })
-      continue
-    }
-    const lo = edge.lo
-    const hi = edge.hi - w
-    let s = g.s
-    if (s < lo || s > hi) s = lo + (hi - lo) / 2
-    else s = Math.min(Math.max(s, lo), hi)
-    out.push({ s, widthMm: g.widthMm, atIndex: g.atIndex })
+    if (remove < 0) break
+    cur.splice(remove, 1)
+    dropped += 1
   }
-
-  out.sort((a, b) => a.s - b.s)
-  const kept: BridgeGap[] = out.filter((g, i) => i === 0 || g.s >= out[i - 1].s + out[i - 1].widthMm + 1e-6)
-  const dropped = out.length - kept.length
-  return { gaps: kept, dropped }
+  return { gaps: cur, dropped }
 }
 
 function gapStats(
@@ -291,66 +302,82 @@ function pointToSegment(p: Pt, a: Pt, b: Pt): number {
 }
 
 /**
- * 应用连刀点：把闭合轮廓拆成若干「切割段」。
- * 闭合轮廓有 n 个缺口就有 n 段刀路（缺口处刀抬起跳过，跨过起点首尾段会正确合并）。
+ * 应用连刀点：把闭合轮廓拆成若干「切割段」，同时返回每个缺口的精确端点锚点。
+ * 闭合轮廓有 n 个缺口就有 n 段刀路；第 i 段为「缺口 i 末端 → 缺口 i+1 起点」，
+ * 最后一段跨越轮廓起点（绕回段）同样完整断开，不会少一截。
+ * 端点按弧长精确插值插入折线，缺口内的几何整段跳过、缺口外的刀路一点不丢。
  */
-export function applyBridges(pts: Pt[], closed: boolean, gaps: BridgeGap[]): CutRun[] {
-  if (!closed || gaps.length === 0) return [{ points: pts, closed }]
+export function applyBridges(
+  pts: Pt[],
+  closed: boolean,
+  gapsIn: BridgeGap[],
+): { runs: CutRun[]; anchors: BridgeAnchor[] } {
+  if (!closed || gapsIn.length === 0) return { runs: [{ points: pts, closed }], anchors: [] }
   const n = pts.length
-  if (n < 3) return [{ points: pts, closed }]
+  if (n < 3) return { runs: [{ points: pts, closed }], anchors: [] }
   const L = polylineLength(pts, true)
-  if (L <= 0) return [{ points: pts, closed }]
+  if (L <= 0) return { runs: [{ points: pts, closed }], anchors: [] }
+
+  // 缺口不允许跨越轮廓起点（s=0），否则会被绕回段切成两半
+  const clamped = gapsIn.map((g) => ({ ...g, s: Math.max(0, Math.min(g.s, L - g.widthMm)) }))
+  // 钳到缝前后可能与相邻缺口重叠，再做一次环形去重
+  const { gaps: sorted } = dropOverlappingGaps(clamped, L)
+  if (sorted.length === 0) return { runs: [{ points: pts, closed: true }], anchors: [] }
+  const gapEnds = sorted.map((g) => g.s + g.widthMm)
+  const starts = sorted.map((g) => g.s)
   const acc = arcTable(pts)
-  const sorted = gaps.slice().sort((a, b) => a.s - b.s)
+  const w = sorted[0].widthMm
 
+  // 第 i 段刀路 = 缺口 i 末端 → 缺口 i+1 起点（最后一段跨越轮廓起点）。
+  // 先算出每段折线，空段（异常输入下缺口贴在一起）连同对应缺口一起丢弃，
+  // 保证「缺口 ↔ 刀路段 ↔ 锚点」始终一一对应不错位。
+  const segs = sorted.map((_, i) => {
+    const a = gapEnds[i]
+    const b = i + 1 < sorted.length ? starts[i + 1] : starts[0] + L
+    return collectArcRun(pts, acc, L, a, b)
+  })
+  const keep = segs.map((points) => points.length >= 2)
   const runs: CutRun[] = []
-  for (let i = 0; i < sorted.length; i++) {
-    const a = sorted[i].s + sorted[i].widthMm
-    const b = (i + 1 < sorted.length ? sorted[i + 1].s : sorted[0].s) + (i + 1 < sorted.length ? 0 : L)
-    const points = collectRun(pts, acc, L, a, b)
-    if (points.length >= 2) runs.push({ points, closed: false })
-  }
-  return runs.length > 0 ? runs : [{ points: pts, closed: true }]
+  const anchors: BridgeAnchor[] = []
+  sorted.forEach((g, i) => {
+    if (!keep[i]) return
+    runs.push({ points: segs[i], closed: false })
+    anchors.push({
+      // at = 缺口前端（沿弧长 s），end = 缺口末端（s + width）
+      at: pointAtArcLength(pts, true, starts[i]),
+      end: pointAtArcLength(pts, true, gapEnds[i] % L),
+      widthMm: g.widthMm || w,
+      atIndex: g.atIndex,
+      localBefore: collectArcRun(pts, acc, L, Math.max(0, starts[i] - w * 3), starts[i]),
+      localAfter: collectArcRun(pts, acc, L, gapEnds[i], Math.min(L, gapEnds[i] + w * 3)),
+    })
+  })
+
+  if (runs.length === 0) return { runs: [{ points: pts, closed: true }], anchors: [] }
+  return { runs, anchors }
 }
 
-/** 取自弧长 a 到 b 的折线（b 可超过 L，表示跨越起点） */
-function collectRun(pts: Pt[], acc: number[], L: number, a: number, b: number): Pt[] {
+/** 取自弧长 [a, b] 的折线；b 可超过 L（跨越轮廓起点）。端点按弧长精确插值。 */
+function collectArcRun(pts: Pt[], acc: number[], L: number, a: number, b: number): Pt[] {
+  if (b <= L + 1e-9) return collectArcSpan(pts, acc, a, b)
+  // 跨越起点：拆成 [a, L] + [0, b-L]，起点处只保留一个点
+  const first = collectArcSpan(pts, acc, a, L)
+  const second = collectArcSpan(pts, acc, 0, b - L)
+  return [...first, ...second.slice(1)]
+}
+
+/** 取自弧长 [a, b]（要求 0 ≤ a ≤ b ≤ L）的折线，端点按弧长精确插值。 */
+function collectArcSpan(pts: Pt[], acc: number[], a: number, b: number): Pt[] {
+  const n = pts.length
   const out: Pt[] = []
-  for (let i = 0; i < pts.length; i++) {
-    const s = acc[i]
-    if (s >= a && s <= b) out.push(pts[i])
+  const push = (p: Pt): void => {
+    const last = out[out.length - 1]
+    if (!last || dist(last, p) > 1e-7) out.push({ x: p.x, y: p.y })
   }
-  if (out.length < 2) {
-    return [{ ...pointAtArcLength(pts, true, a % L) }, { ...pointAtArcLength(pts, true, b % L) }]
+  push(pointAtArcLength(pts, true, a))
+  for (let i = 0; i < n; i++) {
+    if (acc[i] > a + 1e-9 && acc[i] < b - 1e-9) push(pts[i])
   }
-  return out
-}
-
-/** 由刀路段推导连刀点锚点（缺口 = 上一段末尾 → 下一段开头） */
-export function anchorsFromRuns(runs: CutRun[], widthMm: number, atIndices: number[] = [], gapCount = 0): BridgeAnchor[] {
-  if (runs.length === 0) return []
-  // 只有 1 个缺口时：整条轮廓成为 1 段开口刀路，缺口在首尾之间
-  if (runs.length === 1) {
-    if (gapCount <= 0) return []
-    const p = runs[0].points
-    if (p.length < 2) return []
-    return [
-      {
-        at: p[p.length - 1],
-        end: p[0],
-        widthMm,
-        atIndex: atIndices[0] ?? 0,
-        local: [...p.slice(-4), ...p.slice(0, 4)],
-      },
-    ]
-  }
-  const out: BridgeAnchor[] = []
-  for (let i = 0; i < runs.length; i++) {
-    const cur = runs[i]
-    const at = cur.points[0]
-    const end = cur.points[cur.points.length - 1]
-    const local = [...cur.points.slice(0, 4), ...cur.points.slice(-4)]
-    out.push({ at, end, widthMm, atIndex: atIndices[i] ?? 0, local })
-  }
+  push(pointAtArcLength(pts, true, b))
   return out
 }
